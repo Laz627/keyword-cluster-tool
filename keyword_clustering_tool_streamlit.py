@@ -7,49 +7,59 @@ from sklearn.metrics.pairwise import cosine_similarity
 from scipy.cluster.hierarchy import linkage, fcluster
 import io
 
-# --- Streamlit UI Setup (Identical to Original) ---
-st.title('Keyword Research Cluster Analysis Tool')
-st.subheader('Leverage AI to cluster similar keywords into groups from your keyword list.')
+# ==============================================================================
+# 1. STREAMLIT UI CONFIGURATION
+# ==============================================================================
+st.set_page_config(layout="wide")
+st.title('AI-Powered Keyword Clustering Tool')
+st.subheader('Efficiently group large keyword lists using semantic similarity.')
 
-# (Instructions and sample data setup remains the same as before)
-st.markdown("""
-## How to Use This Tool
+# --- Sidebar for Inputs ---
+with st.sidebar:
+    st.header("Configuration")
+    uploaded_file = st.file_uploader("Upload your Keyword CSV", type="csv")
+    api_key = st.text_input("Enter your OpenAI API key", type="password")
+    
+    st.markdown("---")
+    st.header("How to Use")
+    st.markdown("""
+    1.  **Prepare Your Data**: A CSV file with columns: `Keywords`, `Search Volume`, and `CPC`. Blanks are okay.
+    2.  **Upload & Configure**: Upload the CSV and enter your OpenAI API key.
+    3.  **Run Analysis**: The process starts automatically.
+    4.  **Review Results**: The tool will output three tables:
+        - **Clustered Keywords**: Keywords grouped by semantic similarity.
+        - **Unique Keywords**: Keywords that didn't fit into any cluster.
+        - **Failed Keywords**: Keywords that couldn't be processed due to API errors.
+    """)
 
-1.  **Prepare Your Data**:
-    *   Create a CSV file with columns: 'Keywords', 'Search Volume', and 'CPC'. Blank or N/A values for volume/CPC are acceptable.
-    *   Ensure keywords in the 'Keywords' column are unique. You can use the button below to remove duplicates.
+    st.markdown("---")
+    st.header("Sample CSV Template")
+    sample_data = pd.DataFrame({
+        'Keywords': ['buy shoes online', 'purchase shoes online', 'best running shoes', 'comfortable walking shoes'],
+        'Search Volume': [1000, 800, 1500, 1200],
+        'CPC': [0.5, 0.4, 0.7, 0.6]
+    })
+    csv_buffer = io.StringIO()
+    sample_data.to_csv(csv_buffer, index=False)
+    csv_str = csv_buffer.getvalue()
+    st.download_button(
+        label="Download Sample CSV",
+        data=csv_str,
+        file_name="sample_keyword_data.csv",
+        mime="text/csv"
+    )
 
-2.  **Get Your OpenAI API Key**:
-    *   If you don't have one, sign up at [OpenAI](https://openai.com).
-    *   Access to `gpt-3.5-turbo` is recommended for speed and cost-efficiency.
+# ==============================================================================
+# 2. ASYNCHRONOUS HELPER FUNCTIONS (API CALLS)
+# ==============================================================================
 
-3.  **Upload Your File & Enter Key**: The analysis will begin automatically.
-4.  **Review & Download Results**.
+async def fetch_with_semaphore(semaphore, session, keyword, model, max_retries):
+    """Wrapper to control concurrency using an asyncio.Semaphore."""
+    async with semaphore:
+        return await fetch_embedding(session, keyword, model, max_retries)
 
-## Sample CSV Template
-""")
-sample_data = pd.DataFrame({
-    'Keywords': ['buy shoes online', 'purchase shoes online', 'best running shoes', 'comfortable walking shoes'],
-    'Search Volume': [1000, 800, 1500, 1200],
-    'CPC': [0.5, 0.4, 0.7, 0.6]
-})
-csv_buffer = io.StringIO()
-sample_data.to_csv(csv_buffer, index=False)
-csv_str = csv_buffer.getvalue()
-st.download_button(
-    label="Download Sample CSV Template",
-    data=csv_str,
-    file_name="sample_keyword_data.csv",
-    mime="text/csv"
-)
-
-uploaded_file = st.file_uploader("Choose a CSV file", type="csv")
-api_key = st.text_input("Enter your OpenAI API key", type="password")
-
-# --- Optimized & Corrected Functions ---
-
-async def fetch_embedding(session, text, model="text-embedding-3-small", max_retries=3):
-    """Asynchronously fetches a single embedding with a retry mechanism."""
+async def fetch_embedding(session, text, model, max_retries):
+    """Asynchronously fetches a single keyword embedding with robust error handling."""
     retries = 0
     while retries < max_retries:
         try:
@@ -57,168 +67,208 @@ async def fetch_embedding(session, text, model="text-embedding-3-small", max_ret
                 "https://api.openai.com/v1/embeddings",
                 headers={"Authorization": f"Bearer {api_key}"},
                 json={"input": text, "model": model},
-                timeout=20 # Increased timeout for robustness
+                timeout=30  # Increased timeout for stability
             ) as response:
+                if response.status == 429:  # Rate limit error
+                    retry_after = int(response.headers.get("Retry-After", 30))
+                    await asyncio.sleep(retry_after)
+                    continue
                 response.raise_for_status()
                 result = await response.json()
-                return result['data'][0]['embedding']
+                return text, result['data'][0]['embedding']
         except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-            st.warning(f"Embedding error for '{text}': {e}. Retrying... ({retries + 1}/{max_retries})")
             retries += 1
+            if retries >= max_retries:
+                break
             await asyncio.sleep(2 ** retries)
-    st.error(f"Failed to fetch embedding for '{text}' after {max_retries} retries.")
-    return None
+    return text, None  # Return keyword and None on failure
 
-async def generate_all_embeddings(keywords):
-    """Generates embeddings for a list of keywords concurrently."""
+async def generate_all_embeddings(keywords, concurrency_limit=50):
+    """
+    Generates embeddings for a list of keywords with controlled concurrency to prevent
+    API rate limit failures. It returns a map of successful embeddings and a list of failures.
+    """
+    semaphore = asyncio.Semaphore(concurrency_limit)
+    embedding_map = {}
+    failed_keywords = []
+
     async with aiohttp.ClientSession() as session:
-        tasks = [fetch_embedding(session, keyword) for keyword in keywords]
-        embeddings = await asyncio.gather(*tasks)
-    embedding_map = {kw: emb for kw, emb in zip(keywords, embeddings) if emb is not None}
-    return embedding_map
+        tasks = [fetch_with_semaphore(semaphore, session, kw, "text-embedding-3-small", 3) for kw in keywords]
+        
+        # UI progress bar for the embedding step
+        progress_text = f"Fetching embeddings for {len(keywords)} keywords..."
+        st_progress = st.progress(0, text=progress_text)
+        
+        for i, future in enumerate(asyncio.as_completed(tasks)):
+            keyword, embedding = await future
+            if embedding is not None:
+                embedding_map[keyword] = embedding
+            else:
+                failed_keywords.append(keyword)
+            st_progress.progress((i + 1) / len(tasks), text=f"Fetching embeddings: {i + 1}/{len(keywords)} complete")
+        st_progress.empty()
 
-async def choose_best_keyword(session, keyword1, keyword2, model="gpt-3.5-turbo"):
+    return embedding_map, failed_keywords
+
+async def choose_best_keyword(session, keyword1, keyword2):
     """Uses an LLM to determine the best of two keywords for SEO."""
     prompt = f"Between these two keywords, which one has stronger user search intent on Google for SEO: '{keyword1}' or '{keyword2}'? Respond with only the keyword you choose. If they are equivalent, return the first one."
     try:
         async with session.post(
             "https://api.openai.com/v1/chat/completions",
             headers={"Authorization": f"Bearer {api_key}"},
-            json={
-                "model": model, "messages": [{"role": "user", "content": prompt}], "max_tokens": 25, "temperature": 0.0,
-            }
+            json={"model": "gpt-3.5-turbo", "messages": [{"role": "user", "content": prompt}], "max_tokens": 25, "temperature": 0.0}
         ) as response:
             response.raise_for_status()
             result = await response.json()
-            best_keyword = result['choices'][0]['message']['content'].strip()
-            # More robustly check which keyword was returned
-            if keyword2.lower() in best_keyword.lower():
+            # More robust check for returned keyword
+            if keyword2.lower() in result['choices'][0]['message']['content'].strip().lower():
                 return keyword2
-            return keyword1 # Default to the first keyword
+            return keyword1
     except aiohttp.ClientError:
-        return keyword1 # Default to the first one on error
+        return keyword1  # Default to the first keyword on any API error
+
+# ==============================================================================
+# 3. CORE PROCESSING LOGIC
+# ==============================================================================
 
 async def identify_primary_variants(session, cluster_data):
-    """Identifies the primary keyword for each cluster in parallel without creating duplicates."""
+    """
+    Identifies the primary keyword for each cluster in parallel.
+    This function modifies the DataFrame in place and does not create duplicates.
+    """
     primary_variant_tasks = []
-    
+    # Group by the cluster ID to process each cluster
     for cluster_id, group in cluster_data.groupby('Cluster ID'):
         keywords = group['Keywords'].tolist()
         
         if len(keywords) == 2:
+            # For 2-keyword clusters, use LLM to decide
             task = choose_best_keyword(session, keywords[0], keywords[1])
             primary_variant_tasks.append((cluster_id, task))
         elif len(keywords) > 2:
-            embeddings = np.array(group['embedding'].tolist())
+            # For larger clusters, find the most central keyword using embeddings
+            embeddings = np.array([emb for emb in group['embedding']])
             similarity_matrix = cosine_similarity(embeddings)
-            primary_idx = np.argmax(np.mean(similarity_matrix, axis=1))
-            primary = keywords[primary_idx]
-            primary_variant_tasks.append((cluster_id, asyncio.create_task(asyncio.sleep(0, result=primary))))
-
-    primary_keywords_results = await asyncio.gather(*[task for _, task in primary_variant_tasks])
-    primary_map = {cid: primary for (cid, _), primary in zip(primary_variant_tasks, primary_keywords_results)}
+            # The keyword with the highest average similarity to all others is the primary
+            primary_keyword = keywords[np.argmax(np.mean(similarity_matrix, axis=1))]
+            primary_variant_tasks.append((cluster_id, asyncio.create_task(asyncio.sleep(0, result=primary_keyword))))
+            
+    # Execute all API calls and tasks concurrently
+    primary_keyword_results = await asyncio.gather(*[task for _, task in primary_variant_tasks])
+    # Create a mapping from cluster ID to the determined primary keyword
+    primary_map = {cid: primary for (cid, _), primary in zip(primary_variant_tasks, primary_keyword_results)}
     
-    # FIX: Use .map() to assign primary keywords. This is safe and prevents duplication.
+    # Assign the results back to the DataFrame using the safe .map() method
     cluster_data['Primary Keyword'] = cluster_data['Cluster ID'].map(primary_map)
     cluster_data['Is Primary'] = np.where(cluster_data['Keywords'] == cluster_data['Primary Keyword'], 'Yes', 'No')
-    
     return cluster_data
 
 async def process_data(df):
-    """Main data processing pipeline."""
-    st.write("### Analysis Progress")
-    progress_bar = st.progress(0, text="Step 1/4: Generating keyword embeddings...")
-
-    # Step 1: Generate all embeddings once.
-    keywords = df['Keywords'].unique().tolist()
-    embedding_map = await generate_all_embeddings(keywords)
+    """Main data processing pipeline with robust error handling and clear steps."""
+    st.info("Step 1/3: Generating keyword embeddings... (This may take a while for large lists)")
     
-    if not embedding_map:
-        st.error("Could not generate embeddings. Check your API key and OpenAI model access.")
+    unique_keywords = df['Keywords'].unique().tolist()
+    embedding_map, failed_keywords = await generate_all_embeddings(unique_keywords)
+    
+    # Separate failed keywords for later reporting
+    failed_df = df[df['Keywords'].isin(failed_keywords)]
+    
+    # Continue processing only with keywords that were successfully embedded
+    df['embedding'] = df['Keywords'].map(embedding_map)
+    df_to_process = df.dropna(subset=['embedding']).copy()
+
+    if df_to_process.empty:
+        st.error("Could not generate any embeddings. Please check your API key, network connection, and OpenAI account status.")
+        if not failed_df.empty:
+            st.write("### Failed Keywords")
+            st.dataframe(failed_df[['Keywords', 'Search Volume', 'CPC']])
         return
 
-    df['embedding'] = df['Keywords'].map(embedding_map)
-    df.dropna(subset=['embedding'], inplace=True)
-
-    progress_bar.progress(0.25, text="Step 2/4: Clustering keywords...")
-
-    # Step 2: Group and cluster. This correctly handles NA/blank values by creating separate groups for them.
-    grouped = df.groupby(['Search Volume', 'CPC'], dropna=False)
-    df['Cluster ID'] = -1
+    st.info("Step 2/3: Clustering successful keywords...")
+    # Group by volume and CPC. `dropna=False` ensures that rows with N/A are grouped together.
+    grouped = df_to_process.groupby(['Search Volume', 'CPC'], dropna=False)
+    df_to_process['Cluster ID'] = -1
     cluster_id_counter = 0
 
     for _, group in grouped:
         if len(group) > 1:
             embeddings = np.array(group['embedding'].tolist())
             linkage_matrix = linkage(1 - cosine_similarity(embeddings), method='average')
-            # The distance threshold 't' can be adjusted (0.1-0.3 is a good range)
+            # The distance threshold 't' controls how similar keywords must be to be clustered.
             group_clusters = fcluster(linkage_matrix, t=0.2, criterion='distance')
             
-            # Ensure unique cluster IDs across all groups
-            df.loc[group.index, 'Cluster ID'] = group_clusters + cluster_id_counter
+            # Assign unique cluster IDs globally to prevent overlap between groups
+            valid_indices = group.index
+            df_to_process.loc[valid_indices, 'Cluster ID'] = group_clusters + cluster_id_counter
             if group_clusters.max() > 0:
                 cluster_id_counter += group_clusters.max()
 
-    df_clustered = df[df['Cluster ID'] != -1].copy()
-    unique_keywords_df = df[df['Cluster ID'] == -1]
+    df_clustered = df_to_process[df_to_process['Cluster ID'] != -1].copy()
+    unique_keywords_df = df_to_process[df_to_process['Cluster ID'] == -1]
 
-    progress_bar.progress(0.5, text="Step 3/4: Identifying primary variants...")
-
-    # Step 3: Identify primary variants and finalize columns.
+    st.info("Step 3/3: Identifying primary variants and finalizing results...")
+    
+    # --- Final Output Generation ---
+    st.markdown("---")
+    st.header("Analysis Results")
+    
     if not df_clustered.empty:
         async with aiohttp.ClientSession() as session:
             combined_data = await identify_primary_variants(session, df_clustered)
 
-        progress_bar.progress(0.9, text="Step 4/4: Finalizing results...")
-        
-        # FIX: Define columns to show, excluding the 'embedding' vector.
         output_columns = ['Cluster ID', 'Keywords', 'Search Volume', 'CPC', 'Is Primary', 'Primary Keyword']
-        
-        st.write("### Clustered Keywords Analysis")
+        st.subheader(f"Clustered Keywords ({len(combined_data)})")
         st.dataframe(combined_data[output_columns])
+        st.download_button('Download Clustered Results', combined_data[output_columns].to_csv(index=False).encode('utf-8'), 'clustered_results.csv', 'text/csv')
 
-        st.download_button(
-            label='Download Clustered Analysis Results',
-            data=combined_data[output_columns].to_csv(index=False).encode('utf-8'),
-            file_name='clustered_analysis_results.csv',
-            mime='text/csv'
-        )
-    else:
-        st.info("No keyword clusters were formed. All keywords were unique.")
-
-    # Display and allow download of unique keywords.
+    # Display unique keywords
+    unique_columns = ['Keywords', 'Search Volume', 'CPC']
     if not unique_keywords_df.empty:
-        unique_columns = ['Keywords', 'Search Volume', 'CPC']
-        st.write("### Unique Keywords (Not Clustered)")
+        st.subheader(f"Unique Keywords ({len(unique_keywords_df)})")
         st.dataframe(unique_keywords_df[unique_columns])
+        st.download_button('Download Unique Keywords', unique_keywords_df[unique_columns].to_csv(index=False).encode('utf-8'), 'unique_keywords.csv', 'text/csv')
 
-        st.download_button(
-            label='Download Unique Keywords',
-            data=unique_keywords_df[unique_columns].to_csv(index=False).encode('utf-8'),
-            file_name='unique_keywords.csv',
-            mime='text/csv'
-        )
+    # Display failed keywords
+    if not failed_df.empty:
+        st.warning(f"{len(failed_df)} keywords could not be processed, likely due to API errors.")
+        st.subheader(f"Failed Keywords ({len(failed_df)})")
+        st.dataframe(failed_df[unique_columns])
+        st.download_button('Download Failed Keywords', failed_df[unique_columns].to_csv(index=False).encode('utf-8'), 'failed_keywords.csv', 'text/csv')
 
-    progress_bar.progress(1.0, text="Analysis Complete!")
+    st.success("Analysis Complete!")
+    st.balloons()
 
 
-# --- Main Execution Logic ---
+# ==============================================================================
+# 4. MAIN EXECUTION BLOCK
+# ==============================================================================
 if uploaded_file is not None and api_key:
-    data = pd.read_csv(uploaded_file, keep_default_na=False) # keep_default_na=False treats blanks as blanks
+    # Read CSV, treating blank cells as empty strings, not NaN, which helps with grouping.
+    data = pd.read_csv(uploaded_file, keep_default_na=False)
 
-    initial_row_count = len(data)
-    # Remove duplicate keywords to prevent processing errors and ensure clean output
-    data.drop_duplicates(subset=['Keywords'], inplace=True, keep='first')
-    final_row_count = len(data)
+    # Basic data validation
+    if 'Keywords' not in data.columns:
+        st.error("CSV file must include a 'Keywords' column. Please check your file.")
+    else:
+        # Pre-processing: Remove duplicate keywords to ensure a clean run
+        initial_row_count = len(data)
+        data.drop_duplicates(subset=['Keywords'], inplace=True, keep='first')
+        if len(data) < initial_row_count:
+            st.sidebar.info(f"Removed {initial_row_count - len(data)} duplicate keyword rows.")
+        
+        # Add 'Search Volume' and 'CPC' if they are missing
+        if 'Search Volume' not in data.columns:
+            data['Search Volume'] = ""
+        if 'CPC' not in data.columns:
+            data['CPC'] = ""
 
-    if final_row_count < initial_row_count:
-        st.info(f"Removed {initial_row_count - final_row_count} duplicate keyword rows from your file.")
+        # Run the main asynchronous process
+        asyncio.run(process_data(data))
 
-    asyncio.run(process_data(data))
-
-elif not api_key and uploaded_file:
-    st.warning("Please enter your OpenAI API key to proceed.")
-elif api_key and not uploaded_file:
-    st.warning("Please upload a CSV file to proceed.")
-else:
-    st.info("Upload a CSV file and enter your API key to start the analysis.")
+elif not uploaded_file and not api_key:
+    st.info("Welcome! Please upload a CSV file and enter your API key in the sidebar to begin.")
+elif not uploaded_file:
+    st.warning("Please upload a CSV file.")
+elif not api_key:
+    st.warning("Please enter your OpenAI API key.")
